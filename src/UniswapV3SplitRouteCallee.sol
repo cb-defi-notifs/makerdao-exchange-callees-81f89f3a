@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2021 Dai Foundation
+// Copyright (C) 2023 Dai Foundation
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published
@@ -39,89 +39,79 @@ interface CharterManagerLike {
 }
 
 interface UniV3RouterLike {
-    
-    struct ExactInputParams {
-        bytes   path;
-        address recipient;
-        uint256 deadline;
-        uint256 amountIn;
-        uint256 amountOutMinimum;
-    }
-
-    function exactInput(UniV3RouterLike.ExactInputParams calldata params)
-        external payable returns (uint256 amountOut);
+    function multicall(uint256 deadline, bytes[] calldata data) external payable returns (bytes[] memory results);
 }
 
+contract UniswapV3SplitCallee {
+    UniV3RouterLike public immutable uniswapV3Router;
+    DaiJoinLike     public immutable daiJoin;
+    TokenLike       public immutable dai;
 
-contract UniswapV3Callee {
-    UniV3RouterLike         public uniV3Router;
-    DaiJoinLike             public daiJoin;
-    TokenLike               public dai;
+    uint256         public constant RAY = 10**27;
 
-    uint256                 public constant RAY = 10 ** 27;
-
-    function _add(uint x, uint y) internal pure returns (uint z) {
-        require((z = x + y) >= x, "ds-math-add-overflow");
+    function _add(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        require((z = x + y) >= x, 'ds-math-add-overflow');
     }
-    function _sub(uint x, uint y) internal pure returns (uint z) {
-        require((z = x - y) <= x, "ds-math-sub-underflow");
+
+    function _sub(uint256 x, uint256 y) internal pure returns (uint256 z) {
+        require((z = x - y) <= x, 'ds-math-sub-underflow');
     }
+
     function _divup(uint256 x, uint256 y) internal pure returns (uint256 z) {
         z = _add(x, _sub(y, 1)) / y;
     }
 
     constructor(address uniV3Router_, address daiJoin_) public {
-        uniV3Router = UniV3RouterLike(uniV3Router_);
-        daiJoin = DaiJoinLike(daiJoin_);
-        dai = daiJoin.dai();
+        daiJoin         = DaiJoinLike(daiJoin_);
+        TokenLike dai_  = DaiJoinLike(daiJoin_).dai();
+        dai =             dai_;
+        uniswapV3Router = UniV3RouterLike(uniV3Router_);
 
-        dai.approve(daiJoin_, uint256(-1));
+        dai_.approve(daiJoin_, type(uint256).max);
     }
 
     function _fromWad(address gemJoin, uint256 wad) internal view returns (uint256 amt) {
-        amt = wad / 10 ** (_sub(18, GemJoinLike(gemJoin).dec()));
+        amt = wad / 10**(_sub(18, GemJoinLike(gemJoin).dec()));
     }
 
     function clipperCall(
-        address sender,            // Clipper caller, pays back the loan
-        uint256 owe,               // Dai amount to pay back        [rad]
-        uint256 slice,             // Gem amount received           [wad]
-        bytes calldata data        // Extra data, see below
+        address sender,     // Clipper caller, pays back the loan
+        uint256 owe,        // Dai amount to pay back          [rad]
+        uint256 slice,      // Gem amount received           [wad]
+        bytes calldata data // Extra data, see below
     ) external {
         (
-            address to,            // address to send remaining DAI to
-            address gemJoin,       // gemJoin adapter address
-            uint256 minProfit,     // minimum profit in DAI to make [wad]
-            bytes memory path,     // packed encoding of (address, fee, address [, fee, address…])
-            address charterManager // pass address(0) if no manager
-        ) = abi.decode(data, (address, address, uint256, bytes, address));
+            address to,                // address to send remaining DAI to
+            address gemJoin,           // gemJoin adapter address
+            uint256 minProfit,         // minimum profit in DAI to make [wad]
+            address charterManager,    // pass address(0) if no manager
+            bytes memory multicallData // multicall data received from the AlphaRouter
+        ) = abi.decode(data, (address, address, uint256, address, bytes));
 
         // Convert slice to token precision
         slice = _fromWad(gemJoin, slice);
 
         // Exit gem to token
-        if(charterManager != address(0)) {
+        if (charterManager != address(0)) {
             CharterManagerLike(charterManager).exit(gemJoin, address(this), slice);
         } else {
             GemJoinLike(gemJoin).exit(address(this), slice);
         }
 
-        // Approve uniV3 to take gem
+        // Approve Uniswap V3 to take gem
         TokenLike gem = GemJoinLike(gemJoin).gem();
-        gem.approve(address(uniV3Router), slice);
+        gem.approve(address(uniswapV3Router), slice);
 
         // Calculate amount of DAI to Join (as erc20 WAD value)
         uint256 daiToJoin = _divup(owe, RAY);
 
-        // Do operation and get dai amount bought (checking the profit is achieved)
-        UniV3RouterLike.ExactInputParams memory params = UniV3RouterLike.ExactInputParams({
-            path:             path,
-            recipient:        address(this),
-            deadline:         block.timestamp,
-            amountIn:         slice,
-            amountOutMinimum: _add(daiToJoin, minProfit)
-        });
-        uniV3Router.exactInput(params);
+        (, bytes[] memory uniswapTxData) = abi.decode(multicallData, (uint256, bytes[]));
+        uniswapV3Router.multicall(block.timestamp, uniswapTxData);
+
+        // make sure the swap outcome provides the minimal required profit
+        require(
+            dai.balanceOf(address(this)) >= _add(daiToJoin, minProfit), "UniswapV3SplitRouteCallee/insufficient-profit"
+        );
 
         // Although Uniswap will accept all gems, this check is a sanity check, just in case
         // Transfer any lingering gem to specified address
@@ -136,4 +126,3 @@ contract UniswapV3Callee {
         dai.transfer(to, dai.balanceOf(address(this)));
     }
 }
-
